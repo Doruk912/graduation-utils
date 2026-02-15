@@ -6,14 +6,11 @@ import os
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from collections import Counter
 import matplotlib.pyplot as plt
-from google.colab import drive
 
 # Configuration
-drive.mount('/content/drive')
-BASE_PATH = '/content/drive/MyDrive/Bird Dataset'
-OUTPUT_PATH = '/content/drive/MyDrive/Bird Dataset'  # Save CSV in same location
+BASE_PATH = r'C:\Users\Doruk\OneDrive\Masaüstü\Graduation Project\Bird Dataset Processed'
+OUTPUT_PATH = r'C:\Users\Doruk\OneDrive\Masaüstü\Graduation Project\Bird Dataset Processed'  # Save CSV in same location
 
 SPECIES_LIST = [
     "Larus michahellis", "Corvus cornix", "Passer domesticus",
