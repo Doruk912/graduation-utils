@@ -1,8 +1,6 @@
 # ============================================================
 # BIRD SPECIES PREDICTION
 # ============================================================
-# Usage: Change IMAGE_PATH below to any bird photo and run
-# ============================================================
 
 import torch
 import torch.nn as nn
@@ -12,11 +10,11 @@ import pandas as pd
 import os
 
 # ============================================================
-# CONFIGURATION - CHANGE THESE
+# CONFIGURATION
 # ============================================================
 
 # Path to the image you want to classify
-IMAGE_PATH = r"C:\Users\Doruk\Downloads\original.jpg"  # <--- CHANGE THIS
+IMAGE_PATH = r"C:\Users\Doruk\Downloads\large (3).jpg"
 
 # Which model to use for prediction
 MODEL_NAME = 'mobilenet_v2'  # Match the model you trained
