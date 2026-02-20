@@ -1,5 +1,5 @@
 # ============================================================
-# BIRD SPECIES CLASSIFICATION
+# BIRD SPECIES CLASSIFICATION - V2
 # ============================================================
 
 import os
@@ -62,19 +62,27 @@ class Config:
 
     # Training parameters
     NUM_CLASSES = 23
-    NUM_EPOCHS = 25
-    LEARNING_RATE = 0.001
+
+    # Phase 1: Frozen backbone, train only classifier head
+    FREEZE_EPOCHS = 5
+    HEAD_LR = 1e-3
+
+    # Phase 2: Unfreeze all layers, fine-tune with differential LR
+    FINETUNE_EPOCHS = 20
+    BACKBONE_LR = 1e-5
+    FINETUNE_HEAD_LR = 1e-4
+
     WEIGHT_DECAY = 1e-4
+    GRAD_CLIP_MAX_NORM = 1.0
 
     # Batch size will be auto-set based on model (see below)
     BATCH_SIZE = 32
 
-    # Early stopping
-    PATIENCE = 5
+    # Early stopping (applied during fine-tuning phase)
+    PATIENCE = 7
     MIN_DELTA = 0.001
 
     # Data loading
-    # If you get multiprocessing errors, change NUM_WORKERS to 0
     NUM_WORKERS = 4
     PIN_MEMORY = True
 
@@ -82,16 +90,67 @@ class Config:
     SEED = 42
 
 
-# Auto-select batch size based on model (for RTX 4050 6GB VRAM)
-RECOMMENDED_BATCH_SIZES = {
-    'mobilenet_v2': 32,
-    'resnet50': 16,
-    'densenet121': 16,
-    'inception_v3': 16,
-    'vgg16': 8,
-}
-Config.BATCH_SIZE = RECOMMENDED_BATCH_SIZES.get(Config.CURRENT_MODEL, 16)
+# ============================================================
+# PER-MODEL SETTINGS
+# ============================================================
 
+MODEL_SETTINGS = {
+    'mobilenet_v2': {
+        'batch_size': 32,
+        'freeze_epochs': 5,
+        'finetune_epochs': 20,
+        'head_lr': 1e-3,
+        'backbone_lr': 1e-5,
+        'finetune_head_lr': 1e-4,
+        'weight_decay': 1e-4,
+    },
+    'resnet50': {
+        'batch_size': 16,
+        'freeze_epochs': 5,
+        'finetune_epochs': 20,
+        'head_lr': 1e-3,
+        'backbone_lr': 1e-5,
+        'finetune_head_lr': 1e-4,
+        'weight_decay': 1e-4,
+    },
+    'densenet121': {
+        'batch_size': 16,
+        'freeze_epochs': 5,
+        'finetune_epochs': 20,
+        'head_lr': 1e-3,
+        'backbone_lr': 1e-5,
+        'finetune_head_lr': 1e-4,
+        'weight_decay': 1e-4,
+    },
+    'inception_v3': {
+        'batch_size': 16,
+        'freeze_epochs': 5,
+        'finetune_epochs': 20,
+        'head_lr': 1e-3,
+        'backbone_lr': 1e-5,
+        'finetune_head_lr': 1e-4,
+        'weight_decay': 1e-4,
+    },
+    'vgg16': {
+        'batch_size': 8,
+        'freeze_epochs': 10,
+        'finetune_epochs': 20,
+        'head_lr': 1e-3,
+        'backbone_lr': 1e-5,
+        'finetune_head_lr': 1e-4,
+        'weight_decay': 5e-4,
+    },
+}
+
+# Apply per-model settings
+settings = MODEL_SETTINGS.get(Config.CURRENT_MODEL, {})
+Config.BATCH_SIZE = settings.get('batch_size', 16)
+Config.FREEZE_EPOCHS = settings.get('freeze_epochs', 5)
+Config.FINETUNE_EPOCHS = settings.get('finetune_epochs', 20)
+Config.HEAD_LR = settings.get('head_lr', 1e-3)
+Config.BACKBONE_LR = settings.get('backbone_lr', 1e-5)
+Config.FINETUNE_HEAD_LR = settings.get('finetune_head_lr', 1e-4)
+Config.WEIGHT_DECAY = settings.get('weight_decay', 1e-4)
 
 # Set seeds for reproducibility
 torch.manual_seed(Config.SEED)
@@ -142,13 +201,15 @@ print("\nAll paths verified!")
 print("\n" + "=" * 70)
 print("CONFIGURATION")
 print("=" * 70)
-print(f"  Model:            {Config.CURRENT_MODEL.upper()}")
-print(f"  Batch size:       {Config.BATCH_SIZE}")
-print(f"  Max epochs:       {Config.NUM_EPOCHS}")
-print(f"  Learning rate:    {Config.LEARNING_RATE}")
-print(f"  Early stop:       patience={Config.PATIENCE}")
-print(f"  Workers:          {Config.NUM_WORKERS}")
-print(f"  Save directory:   {Config.SAVE_DIR}")
+print(f"  Model:              {Config.CURRENT_MODEL.upper()}")
+print(f"  Batch size:         {Config.BATCH_SIZE}")
+print(f"  Phase 1 (frozen):   {Config.FREEZE_EPOCHS} epochs, head LR={Config.HEAD_LR}")
+print(f"  Phase 2 (finetune): {Config.FINETUNE_EPOCHS} epochs, backbone LR={Config.BACKBONE_LR}, head LR={Config.FINETUNE_HEAD_LR}")
+print(f"  Weight decay:       {Config.WEIGHT_DECAY}")
+print(f"  Grad clip norm:     {Config.GRAD_CLIP_MAX_NORM}")
+print(f"  Early stop:         patience={Config.PATIENCE}")
+print(f"  Workers:            {Config.NUM_WORKERS}")
+print(f"  Save directory:     {Config.SAVE_DIR}")
 
 
 # ============================================================
@@ -165,7 +226,7 @@ def get_transforms(model_name):
         resize_size = 256
 
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0), ratio=(0.8, 1.2)),
+        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
         transforms.ToTensor(),
@@ -224,35 +285,114 @@ class BirdDataset(Dataset):
 # ============================================================
 
 def get_model(model_name, num_classes, pretrained=True):
-    """Get a pretrained model and modify the final layer."""
+    """Get a pretrained model, freeze backbone, and replace the classifier head."""
 
     print(f"\n  Loading {model_name} with pretrained weights...")
 
     if model_name == 'vgg16':
         model = models.vgg16(weights='IMAGENET1K_V1' if pretrained else None)
-        model.classifier[6] = nn.Linear(4096, num_classes)
+
+        # Freeze all feature layers
+        for param in model.features.parameters():
+            param.requires_grad = False
+
+        # Replace the classifier with a smaller, more appropriate one
+        model.classifier = nn.Sequential(
+            nn.Linear(25088, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(4096, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
 
     elif model_name == 'resnet50':
         model = models.resnet50(weights='IMAGENET1K_V1' if pretrained else None)
+
+        # Freeze all layers except the final FC
+        for param in model.parameters():
+            param.requires_grad = False
+
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     elif model_name == 'inception_v3':
         model = models.inception_v3(weights='IMAGENET1K_V1' if pretrained else None)
+
+        # Freeze all layers except the classifier heads
+        for param in model.parameters():
+            param.requires_grad = False
+
         model.AuxLogits.fc = nn.Linear(model.AuxLogits.fc.in_features, num_classes)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     elif model_name == 'mobilenet_v2':
         model = models.mobilenet_v2(weights='IMAGENET1K_V1' if pretrained else None)
+
+        # Freeze all feature layers
+        for param in model.features.parameters():
+            param.requires_grad = False
+
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
 
     elif model_name == 'densenet121':
         model = models.densenet121(weights='IMAGENET1K_V1' if pretrained else None)
+
+        # Freeze all feature layers
+        for param in model.features.parameters():
+            param.requires_grad = False
+
         model.classifier = nn.Linear(model.classifier.in_features, num_classes)
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
     return model
+
+
+def unfreeze_model(model, model_name):
+    """Unfreeze all layers for fine-tuning phase."""
+    for param in model.parameters():
+        param.requires_grad = True
+    print(f"  All layers unfrozen for fine-tuning.")
+
+
+def get_parameter_groups(model, model_name, backbone_lr, head_lr, weight_decay):
+    """Create parameter groups with differential learning rates."""
+
+    backbone_params = []
+    head_params = []
+
+    if model_name == 'vgg16':
+        backbone_params = list(model.features.parameters())
+        head_params = list(model.classifier.parameters())
+
+    elif model_name == 'resnet50':
+        head_params = list(model.fc.parameters())
+        backbone_params = [p for name, p in model.named_parameters()
+                           if not name.startswith('fc')]
+
+    elif model_name == 'inception_v3':
+        head_params = list(model.fc.parameters()) + list(model.AuxLogits.fc.parameters())
+        backbone_params = [p for name, p in model.named_parameters()
+                           if not name.startswith('fc') and 'AuxLogits.fc' not in name]
+
+    elif model_name == 'mobilenet_v2':
+        backbone_params = list(model.features.parameters())
+        head_params = list(model.classifier.parameters())
+
+    elif model_name == 'densenet121':
+        backbone_params = list(model.features.parameters())
+        head_params = list(model.classifier.parameters())
+
+    param_groups = [
+        {'params': [p for p in backbone_params if p.requires_grad],
+         'lr': backbone_lr, 'weight_decay': weight_decay},
+        {'params': [p for p in head_params if p.requires_grad],
+         'lr': head_lr, 'weight_decay': weight_decay},
+    ]
+
+    return param_groups
 
 
 def count_parameters(model):
@@ -267,7 +407,7 @@ def count_parameters(model):
 # ============================================================
 
 class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0.001):
+    def __init__(self, patience=7, min_delta=0.001):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
@@ -289,40 +429,27 @@ class EarlyStopping:
 
 
 # ============================================================
-# TRAINING FUNCTION
+# TRAINING FUNCTION (single phase)
 # ============================================================
 
-def train_model(model, model_name, train_loader, val_loader, criterion,
-                optimizer, scheduler, num_epochs, device, save_dir):
-    """Train a single model and return training history."""
+def train_phase(model, model_name, train_loader, val_loader, criterion,
+                optimizer, scheduler, num_epochs, device, save_dir,
+                phase_name, history, best_acc, best_epoch, start_time,
+                early_stopping=None):
+    """Train model for one phase and return updated history."""
 
     print(f"\n{'=' * 70}")
-    print(f"  TRAINING: {model_name.upper()}")
+    print(f"  {phase_name}: {model_name.upper()}")
     print(f"{'=' * 70}")
     print(f"  Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    model = model.to(device)
     best_model_wts = copy.deepcopy(model.state_dict())
-    best_acc = 0.0
-    best_epoch = 0
-
-    early_stopping = EarlyStopping(
-        patience=Config.PATIENCE,
-        min_delta=Config.MIN_DELTA
-    )
-
-    history = {
-        'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': [],
-        'lr': []
-    }
-
-    start_time = time.time()
 
     for epoch in range(num_epochs):
         epoch_start = time.time()
+        global_epoch = len(history['train_loss']) + 1
 
-        print(f"\n  --- Epoch {epoch + 1}/{num_epochs} ---")
+        print(f"\n  --- {phase_name} Epoch {epoch + 1}/{num_epochs} (Global: {global_epoch}) ---")
 
         # ========== TRAINING PHASE ==========
         model.train()
@@ -349,6 +476,10 @@ def train_model(model, model_name, train_loader, val_loader, criterion,
                 loss = criterion(outputs, labels)
 
             loss.backward()
+
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=Config.GRAD_CLIP_MAX_NORM)
+
             optimizer.step()
 
             _, preds = torch.max(outputs, 1)
@@ -388,8 +519,15 @@ def train_model(model, model_name, train_loader, val_loader, criterion,
         epoch_val_loss = running_loss / len(val_loader.dataset)
         epoch_val_acc = running_corrects / len(val_loader.dataset)
 
-        scheduler.step(epoch_val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
+        # Step the scheduler
+        if isinstance(scheduler, optim.lr_scheduler.CosineAnnealingLR):
+            scheduler.step()
+        elif isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(epoch_val_loss)
+
+        # Get current LR (from head params group)
+        current_lr = optimizer.param_groups[-1]['lr']
+        backbone_lr = optimizer.param_groups[0]['lr'] if len(optimizer.param_groups) > 1 else current_lr
 
         history['train_loss'].append(epoch_train_loss)
         history['train_acc'].append(epoch_train_acc)
@@ -402,16 +540,16 @@ def train_model(model, model_name, train_loader, val_loader, criterion,
 
         print(f"    Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f}")
         print(f"    Val Loss:   {epoch_val_loss:.4f} | Val Acc:   {epoch_val_acc:.4f}")
-        print(f"    LR: {current_lr:.6f} | Time: {epoch_time / 60:.1f}m | Total: {elapsed / 60:.1f}m")
+        print(f"    Head LR: {current_lr:.6f} | Backbone LR: {backbone_lr:.6f} | Time: {epoch_time / 60:.1f}m | Total: {elapsed / 60:.1f}m")
 
         if epoch_val_acc > best_acc:
             best_acc = epoch_val_acc
-            best_epoch = epoch + 1
+            best_epoch = global_epoch
             best_model_wts = copy.deepcopy(model.state_dict())
 
             checkpoint_path = os.path.join(save_dir, f'{model_name}_best.pth')
             torch.save({
-                'epoch': epoch,
+                'epoch': global_epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_acc': best_acc,
@@ -419,28 +557,16 @@ def train_model(model, model_name, train_loader, val_loader, criterion,
             }, checkpoint_path)
             print(f"    >>> NEW BEST! Saved (acc: {best_acc:.4f})")
 
-        if early_stopping(epoch_val_loss):
-            print(f"\n  EARLY STOPPING at epoch {epoch + 1}")
-            print(f"  Best accuracy: {best_acc:.4f} at epoch {best_epoch}")
-            break
+        if early_stopping is not None:
+            if early_stopping(epoch_val_loss):
+                print(f"\n  EARLY STOPPING at {phase_name} epoch {epoch + 1}")
+                print(f"  Best accuracy: {best_acc:.4f} at global epoch {best_epoch}")
+                break
 
-    total_time = time.time() - start_time
-
+    # Restore best weights
     model.load_state_dict(best_model_wts)
 
-    final_path = os.path.join(save_dir, f'{model_name}_final.pth')
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'best_acc': best_acc,
-        'history': history,
-        'training_time': total_time
-    }, final_path)
-
-    print(f"\n  Training complete for {model_name.upper()}")
-    print(f"  Total time: {total_time / 60:.1f} minutes")
-    print(f"  Best epoch: {best_epoch}, Best val acc: {best_acc:.4f}")
-
-    return model, history, best_acc, total_time
+    return model, history, best_acc, best_epoch
 
 
 # ============================================================
@@ -479,9 +605,9 @@ def evaluate_model(model, test_loader, device):
                                  top_k_accuracy_score)
 
     accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='weighted')
-    recall = recall_score(all_labels, all_preds, average='weighted')
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
     top5_acc = top_k_accuracy_score(all_labels, all_probs, k=5)
 
     return {
@@ -500,14 +626,17 @@ def evaluate_model(model, test_loader, device):
 # PLOTTING FUNCTIONS
 # ============================================================
 
-def plot_training_history(history, model_name, save_dir):
-    """Plot and save training history."""
+def plot_training_history(history, model_name, save_dir, freeze_epochs):
+    """Plot and save training history with phase boundary."""
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     epochs = range(1, len(history['train_loss']) + 1)
 
     axes[0].plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
     axes[0].plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+    if freeze_epochs < len(history['train_loss']):
+        axes[0].axvline(x=freeze_epochs + 0.5, color='green', linestyle='--',
+                        alpha=0.7, label='Unfreeze point')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Loss')
     axes[0].set_title(f'{model_name.upper()} - Loss', fontweight='bold')
@@ -516,6 +645,9 @@ def plot_training_history(history, model_name, save_dir):
 
     axes[1].plot(epochs, history['train_acc'], 'b-', label='Train Acc', linewidth=2)
     axes[1].plot(epochs, history['val_acc'], 'r-', label='Val Acc', linewidth=2)
+    if freeze_epochs < len(history['train_loss']):
+        axes[1].axvline(x=freeze_epochs + 0.5, color='green', linestyle='--',
+                        alpha=0.7, label='Unfreeze point')
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Accuracy')
     axes[1].set_title(f'{model_name.upper()} - Accuracy', fontweight='bold')
@@ -636,36 +768,129 @@ def main():
         persistent_workers=use_persistent
     )
 
-    # Create model
+    # Create model (backbone frozen by default)
     model = get_model(model_name, Config.NUM_CLASSES, pretrained=True)
+    model = model.to(device)
+
     total_params, trainable_params = count_parameters(model)
     print(f"\n  Total parameters:     {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,} (head only)")
 
-    # Loss, optimizer, scheduler
+    # Loss function
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=Config.LEARNING_RATE,
-        weight_decay=Config.WEIGHT_DECAY
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2
+
+    # ========================================================
+    # PHASE 1: Train only the classifier head (backbone frozen)
+    # ========================================================
+
+    print("\n" + "=" * 70)
+    print("  PHASE 1: TRAINING CLASSIFIER HEAD (backbone frozen)")
+    print("=" * 70)
+
+    # Only optimize trainable (head) parameters
+    head_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_phase1 = optim.Adam(head_params, lr=Config.HEAD_LR, weight_decay=Config.WEIGHT_DECAY)
+    scheduler_phase1 = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_phase1, T_max=Config.FREEZE_EPOCHS, eta_min=Config.HEAD_LR * 0.1
     )
 
-    # Train
-    model, history, best_val_acc, training_time = train_model(
+    history = {
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [],
+        'lr': []
+    }
+
+    start_time = time.time()
+
+    model, history, best_acc, best_epoch = train_phase(
         model=model,
         model_name=model_name,
         train_loader=train_loader,
         val_loader=val_loader,
         criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        num_epochs=Config.NUM_EPOCHS,
+        optimizer=optimizer_phase1,
+        scheduler=scheduler_phase1,
+        num_epochs=Config.FREEZE_EPOCHS,
         device=device,
-        save_dir=Config.SAVE_DIR
+        save_dir=Config.SAVE_DIR,
+        phase_name="PHASE 1 (Frozen)",
+        history=history,
+        best_acc=0.0,
+        best_epoch=0,
+        start_time=start_time,
+        early_stopping=None  # No early stopping in phase 1
     )
+
+    phase1_time = time.time() - start_time
+    print(f"\n  Phase 1 complete. Best val acc: {best_acc:.4f} at epoch {best_epoch}")
+    print(f"  Phase 1 time: {phase1_time / 60:.1f} minutes")
+
+    # ========================================================
+    # PHASE 2: Fine-tune all layers with differential LR
+    # ========================================================
+
+    print("\n" + "=" * 70)
+    print("  PHASE 2: FINE-TUNING ALL LAYERS (differential learning rates)")
+    print("=" * 70)
+
+    # Unfreeze all layers
+    unfreeze_model(model, model_name)
+
+    total_params2, trainable_params2 = count_parameters(model)
+    print(f"  Trainable parameters: {trainable_params2:,} (all layers)")
+
+    # Create optimizer with differential learning rates
+    param_groups = get_parameter_groups(
+        model, model_name,
+        backbone_lr=Config.BACKBONE_LR,
+        head_lr=Config.FINETUNE_HEAD_LR,
+        weight_decay=Config.WEIGHT_DECAY
+    )
+
+    optimizer_phase2 = optim.Adam(param_groups)
+    scheduler_phase2 = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_phase2, T_max=Config.FINETUNE_EPOCHS,
+        eta_min=Config.BACKBONE_LR * 0.1
+    )
+
+    early_stopping = EarlyStopping(
+        patience=Config.PATIENCE,
+        min_delta=Config.MIN_DELTA
+    )
+
+    model, history, best_acc, best_epoch = train_phase(
+        model=model,
+        model_name=model_name,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer_phase2,
+        scheduler=scheduler_phase2,
+        num_epochs=Config.FINETUNE_EPOCHS,
+        device=device,
+        save_dir=Config.SAVE_DIR,
+        phase_name="PHASE 2 (Fine-tune)",
+        history=history,
+        best_acc=best_acc,
+        best_epoch=best_epoch,
+        start_time=start_time,
+        early_stopping=early_stopping
+    )
+
+    total_time = time.time() - start_time
+
+    # Save final model
+    final_path = os.path.join(Config.SAVE_DIR, f'{model_name}_final.pth')
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'best_acc': best_acc,
+        'history': history,
+        'training_time': total_time
+    }, final_path)
+
+    print(f"\n  Training complete for {model_name.upper()}")
+    print(f"  Total time: {total_time / 60:.1f} minutes")
+    print(f"  Best epoch: {best_epoch}, Best val acc: {best_acc:.4f}")
 
     # Evaluate on test set
     test_metrics = evaluate_model(model, test_loader, device)
@@ -674,16 +899,16 @@ def main():
     print("\n" + "=" * 70)
     print(f"  FINAL RESULTS: {model_name.upper()}")
     print("=" * 70)
-    print(f"  Validation Accuracy:  {best_val_acc:.4f} ({best_val_acc * 100:.2f}%)")
+    print(f"  Validation Accuracy:  {best_acc:.4f} ({best_acc * 100:.2f}%)")
     print(f"  Test Accuracy:        {test_metrics['accuracy']:.4f} ({test_metrics['accuracy'] * 100:.2f}%)")
     print(f"  Top-5 Accuracy:       {test_metrics['top5_accuracy']:.4f} ({test_metrics['top5_accuracy'] * 100:.2f}%)")
     print(f"  Precision:            {test_metrics['precision']:.4f}")
     print(f"  Recall:               {test_metrics['recall']:.4f}")
     print(f"  F1 Score:             {test_metrics['f1_score']:.4f}")
-    print(f"  Training Time:        {training_time / 60:.1f} minutes")
+    print(f"  Training Time:        {total_time / 60:.1f} minutes")
 
     # Plot
-    plot_training_history(history, model_name, Config.SAVE_DIR)
+    plot_training_history(history, model_name, Config.SAVE_DIR, Config.FREEZE_EPOCHS)
     plot_confusion_matrix(
         test_metrics['labels'],
         test_metrics['predictions'],
@@ -695,30 +920,41 @@ def main():
     # Save results to comparison CSV
     results = {
         'model': model_name,
-        'total_parameters': total_params,
-        'trainable_parameters': trainable_params,
+        'total_parameters': total_params2,
+        'trainable_parameters': trainable_params2,
         'batch_size': Config.BATCH_SIZE,
-        'epochs_trained': len(history['train_loss']),
-        'val_accuracy': best_val_acc,
+        'freeze_epochs': Config.FREEZE_EPOCHS,
+        'finetune_epochs': len(history['train_loss']) - Config.FREEZE_EPOCHS,
+        'total_epochs': len(history['train_loss']),
+        'head_lr': Config.HEAD_LR,
+        'backbone_lr': Config.BACKBONE_LR,
+        'val_accuracy': best_acc,
         'test_accuracy': test_metrics['accuracy'],
         'top5_accuracy': test_metrics['top5_accuracy'],
         'precision': test_metrics['precision'],
         'recall': test_metrics['recall'],
         'f1_score': test_metrics['f1_score'],
-        'training_time_min': training_time / 60,
+        'training_time_min': total_time / 60,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
 
     results_csv_path = os.path.join(Config.SAVE_DIR, 'model_comparison.csv')
-    if os.path.exists(results_csv_path):
-        existing = pd.read_csv(results_csv_path)
-        existing = existing[existing['model'] != model_name]
-        new_df = pd.concat([existing, pd.DataFrame([results])], ignore_index=True)
-    else:
-        new_df = pd.DataFrame([results])
+    try:
+        if os.path.exists(results_csv_path):
+            existing = pd.read_csv(results_csv_path)
+            existing = existing[existing['model'] != model_name]
+            new_df = pd.concat([existing, pd.DataFrame([results])], ignore_index=True)
+        else:
+            new_df = pd.DataFrame([results])
 
-    new_df.to_csv(results_csv_path, index=False)
-    print(f"\n  Results saved to: {results_csv_path}")
+        new_df.to_csv(results_csv_path, index=False)
+        print(f"\n  Results saved to: {results_csv_path}")
+    except PermissionError:
+        # Fallback: save to a different file if the original is locked
+        alt_path = os.path.join(Config.SAVE_DIR, f'model_comparison_{model_name}.csv')
+        pd.DataFrame([results]).to_csv(alt_path, index=False)
+        print(f"\n  WARNING: Could not write to {results_csv_path} (file locked)")
+        print(f"  Results saved to: {alt_path}")
 
     # Cleanup
     torch.cuda.empty_cache()
